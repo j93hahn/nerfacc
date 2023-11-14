@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import tqdm
 from lpips import LPIPS
 from radiance_fields.ngp import NGPRadianceField
+from fabric.utils.event import EventStorage
 
 from examples.utils import (
     MIPNERF360_UNBOUNDED_SCENES,
@@ -28,8 +29,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--data_root",
     type=str,
-    # default=str(pathlib.Path.cwd() / "data/360_v2"),
-    default=str(pathlib.Path.cwd() / "data/nerf_synthetic"),
+    default=str(pathlib.Path("/share/data/pals/jjahn/data/real_360")),
     help="the root dir of the dataset",
 )
 parser.add_argument(
@@ -42,9 +42,15 @@ parser.add_argument(
 parser.add_argument(
     "--scene",
     type=str,
-    default="lego",
+    default="garden",
     choices=NERF_SYNTHETIC_SCENES + MIPNERF360_UNBOUNDED_SCENES,
     help="which scene to use",
+)
+parser.add_argument(
+    "--distance_scale",
+    type=float,
+    default=1.0,
+    help="the scale of the scene",
 )
 args = parser.parse_args()
 
@@ -148,115 +154,117 @@ lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
 lpips_fn = lambda x, y: lpips_net(lpips_norm_fn(x), lpips_norm_fn(y)).mean()
 
 # training
-tic = time.time()
-for step in range(max_steps + 1):
-    radiance_field.train()
-    estimator.train()
+with EventStorage() as metric:
+    for step in tqdm.tqdm(range(max_steps + 1)):
+        radiance_field.train()
+        estimator.train()
 
-    i = torch.randint(0, len(train_dataset), (1,)).item()
-    data = train_dataset[i]
+        i = torch.randint(0, len(train_dataset), (1,)).item()
+        data = train_dataset[i]
 
-    render_bkgd = data["color_bkgd"]
-    rays = data["rays"]
-    pixels = data["pixels"]
+        render_bkgd = data["color_bkgd"]
+        rays = data["rays"]
+        pixels = data["pixels"]
 
-    def occ_eval_fn(x):
-        density = radiance_field.query_density(x)
-        return density * render_step_size
+        def occ_eval_fn(x):
+            density = radiance_field.query_density(x)
+            return density * render_step_size
 
-    # update occupancy grid
-    estimator.update_every_n_steps(
-        step=step,
-        occ_eval_fn=occ_eval_fn,
-        occ_thre=1e-2,
-    )
-
-    # render
-    rgb, acc, depth, n_rendering_samples = render_image_with_occgrid(
-        radiance_field,
-        estimator,
-        rays,
-        # rendering options
-        near_plane=near_plane,
-        render_step_size=render_step_size,
-        render_bkgd=render_bkgd,
-        cone_angle=cone_angle,
-        alpha_thre=alpha_thre,
-    )
-    if n_rendering_samples == 0:
-        continue
-
-    if target_sample_batch_size > 0:
-        # dynamic batch size for rays to keep sample batch size constant.
-        num_rays = len(pixels)
-        num_rays = int(
-            num_rays * (target_sample_batch_size / float(n_rendering_samples))
-        )
-        train_dataset.update_num_rays(num_rays)
-
-    # compute loss
-    loss = F.smooth_l1_loss(rgb, pixels)
-
-    optimizer.zero_grad()
-    # do not unscale it because we are using Adam.
-    grad_scaler.scale(loss).backward()
-    optimizer.step()
-    scheduler.step()
-
-    if step % 10000 == 0:
-        elapsed_time = time.time() - tic
-        loss = F.mse_loss(rgb, pixels)
-        psnr = -10.0 * torch.log(loss) / np.log(10.0)
-        print(
-            f"elapsed_time={elapsed_time:.2f}s | step={step} | "
-            f"loss={loss:.5f} | psnr={psnr:.2f} | "
-            f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
-            f"max_depth={depth.max():.3f} | "
+        # update occupancy grid
+        estimator.update_every_n_steps(
+            step=step,
+            occ_eval_fn=occ_eval_fn,
+            occ_thre=1e-2,
         )
 
-    if step > 0 and step % max_steps == 0:
-        # evaluation
-        radiance_field.eval()
-        estimator.eval()
+        # render
+        rgb, acc, depth, n_rendering_samples = render_image_with_occgrid(
+            radiance_field,
+            estimator,
+            rays,
+            # rendering options
+            near_plane=near_plane,
+            render_step_size=render_step_size,
+            render_bkgd=render_bkgd,
+            cone_angle=cone_angle,
+            alpha_thre=alpha_thre,
+        )
+        if n_rendering_samples == 0:
+            continue
 
-        psnrs = []
-        lpips = []
-        with torch.no_grad():
-            for i in tqdm.tqdm(range(len(test_dataset))):
-                data = test_dataset[i]
-                render_bkgd = data["color_bkgd"]
-                rays = data["rays"]
-                pixels = data["pixels"]
+        if target_sample_batch_size > 0:
+            # dynamic batch size for rays to keep sample batch size constant.
+            num_rays = len(pixels)
+            num_rays = int(
+                num_rays * (target_sample_batch_size / float(n_rendering_samples))
+            )
+            train_dataset.update_num_rays(num_rays)
 
-                # rendering
-                rgb, acc, depth, _ = render_image_with_occgrid_test(
-                    1024,
-                    # scene
-                    radiance_field,
-                    estimator,
-                    rays,
-                    # rendering options
-                    near_plane=near_plane,
-                    render_step_size=render_step_size,
-                    render_bkgd=render_bkgd,
-                    cone_angle=cone_angle,
-                    alpha_thre=alpha_thre,
-                )
-                mse = F.mse_loss(rgb, pixels)
-                psnr = -10.0 * torch.log(mse) / np.log(10.0)
-                psnrs.append(psnr.item())
-                lpips.append(lpips_fn(rgb, pixels).item())
-                # if i == 0:
-                #     imageio.imwrite(
-                #         "rgb_test.png",
-                #         (rgb.cpu().numpy() * 255).astype(np.uint8),
-                #     )
-                #     imageio.imwrite(
-                #         "rgb_error.png",
-                #         (
-                #             (rgb - pixels).norm(dim=-1).cpu().numpy() * 255
-                #         ).astype(np.uint8),
-                #     )
-        psnr_avg = sum(psnrs) / len(psnrs)
-        lpips_avg = sum(lpips) / len(lpips)
-        print(f"evaluation: psnr_avg={psnr_avg}, lpips_avg={lpips_avg}")
+        # compute loss
+        loss = F.smooth_l1_loss(rgb, pixels)
+
+        optimizer.zero_grad()
+        # do not unscale it because we are using Adam.
+        grad_scaler.scale(loss).backward()
+        optimizer.step()
+        scheduler.step()
+
+        if step % 10 == 0:  # log train PSNR every 10 steps
+            loss = F.mse_loss(rgb, pixels)
+            psnr = -10.0 * torch.log(loss) / np.log(10.0)
+            metric.put_scalars(psnr=psnr.item())
+            # print(
+            #     f"elapsed_time={elapsed_time:.2f}s | step={step} | "
+            #     f"loss={loss:.5f} | psnr={psnr:.2f} | "
+            #     f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
+            #     f"max_depth={depth.max():.3f} | "
+            # )
+
+        if step > 0 and step % 10000 == 0:  # full evaluation every 10K steps
+            # evaluation
+            radiance_field.eval()
+            estimator.eval()
+
+            psnrs = []
+            lpips = []
+            with torch.no_grad():
+                for i in range(len(test_dataset)):
+                    data = test_dataset[i]
+                    render_bkgd = data["color_bkgd"]
+                    rays = data["rays"]
+                    pixels = data["pixels"]
+
+                    # rendering
+                    rgb, acc, depth, _ = render_image_with_occgrid_test(
+                        1024,
+                        # scene
+                        radiance_field,
+                        estimator,
+                        rays,
+                        # rendering options
+                        near_plane=near_plane,
+                        render_step_size=render_step_size,
+                        render_bkgd=render_bkgd,
+                        cone_angle=cone_angle,
+                        alpha_thre=alpha_thre,
+                    )
+                    mse = F.mse_loss(rgb, pixels)
+                    psnr = -10.0 * torch.log(mse) / np.log(10.0)
+                    psnrs.append(psnr.item())
+                    lpips.append(lpips_fn(rgb, pixels).item())
+                    # if i == 0:
+                    #     imageio.imwrite(
+                    #         "rgb_test.png",
+                    #         (rgb.cpu().numpy() * 255).astype(np.uint8),
+                    #     )
+                    #     imageio.imwrite(
+                    #         "rgb_error.png",
+                    #         (
+                    #             (rgb - pixels).norm(dim=-1).cpu().numpy() * 255
+                    #         ).astype(np.uint8),
+                    #     )
+            psnr_avg = sum(psnrs) / len(psnrs)
+            lpips_avg = sum(lpips) / len(lpips)
+            metric.put_scalars(test_psnr=psnr_avg, test_lpips=lpips_avg)
+            # print(f"evaluation: psnr_avg={psnr_avg}, lpips_avg={lpips_avg}")
+        metric.step()
