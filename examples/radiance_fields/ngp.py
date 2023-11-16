@@ -74,13 +74,14 @@ class NGPRadianceField(torch.nn.Module):
         aabb: Union[torch.Tensor, List[float]],
         num_dim: int = 3,
         use_viewdirs: bool = True,
-        density_activation: Callable = lambda x: trunc_exp(x - 1),
+        density_activation: Callable = lambda x: trunc_exp(x),  # trunc_exp(x - 1)
         unbounded: bool = False,
         base_resolution: int = 16,
         max_resolution: int = 4096,
         geo_feat_dim: int = 15,
         n_levels: int = 16,
         log2_hashmap_size: int = 19,
+        distance_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if not isinstance(aabb, torch.Tensor):
@@ -170,6 +171,7 @@ class NGPRadianceField(torch.nn.Module):
         density_before_activation, base_mlp_out = torch.split(
             x, [1, self.geo_feat_dim], dim=-1
         )
+        # _density_before_activation = density_before_activation.clone() + self.density_shift
         density = (
             self.density_activation(density_before_activation)
             * selector[..., None]

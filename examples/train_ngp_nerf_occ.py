@@ -11,7 +11,8 @@ import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
-import tqdm
+import sys
+from tqdm.auto import tqdm
 from lpips import LPIPS
 from radiance_fields.ngp import NGPRadianceField
 from fabric.utils.event import EventStorage
@@ -129,7 +130,7 @@ estimator = OccGridEstimator(
 
 # setup the radiance field we want to train.
 grad_scaler = torch.cuda.amp.GradScaler(2**10)
-radiance_field = NGPRadianceField(aabb=estimator.aabbs[-1]).to(device)
+radiance_field = NGPRadianceField(aabb=estimator.aabbs[-1], distance_scale=args.distance_scale).to(device)
 optimizer = torch.optim.Adam(
     radiance_field.parameters(), lr=1e-2, eps=1e-15, weight_decay=weight_decay
 )
@@ -154,8 +155,10 @@ lpips_norm_fn = lambda x: x[None, ...].permute(0, 3, 1, 2) * 2 - 1
 lpips_fn = lambda x, y: lpips_net(lpips_norm_fn(x), lpips_norm_fn(y)).mean()
 
 # training
+pbar = tqdm(range(max_steps + 1), miniters=10, file=sys.stdout)
 with EventStorage() as metric:
-    for step in tqdm.tqdm(range(max_steps + 1)):
+    psnr_avg = 0.0
+    for step in pbar:
         radiance_field.train()
         estimator.train()
 
@@ -209,17 +212,6 @@ with EventStorage() as metric:
         optimizer.step()
         scheduler.step()
 
-        if step % 10 == 0:  # log train PSNR every 10 steps
-            loss = F.mse_loss(rgb, pixels)
-            psnr = -10.0 * torch.log(loss) / np.log(10.0)
-            metric.put_scalars(psnr=psnr.item())
-            # print(
-            #     f"elapsed_time={elapsed_time:.2f}s | step={step} | "
-            #     f"loss={loss:.5f} | psnr={psnr:.2f} | "
-            #     f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
-            #     f"max_depth={depth.max():.3f} | "
-            # )
-
         if step > 0 and step % 10000 == 0:  # full evaluation every 10K steps
             # evaluation
             radiance_field.eval()
@@ -266,5 +258,21 @@ with EventStorage() as metric:
             psnr_avg = sum(psnrs) / len(psnrs)
             lpips_avg = sum(lpips) / len(lpips)
             metric.put_scalars(test_psnr=psnr_avg, test_lpips=lpips_avg)
-            # print(f"evaluation: psnr_avg={psnr_avg}, lpips_avg={lpips_avg}")
+
+        if step % 10 == 0:  # log train PSNR every 10 steps
+            loss = F.mse_loss(rgb, pixels)
+            psnr = -10.0 * torch.log(loss) / np.log(10.0)
+            metric.put_scalars(psnr=psnr.item())
+            pbar.set_description(
+                f'Iteration {step:05d}:'
+                + f' train_psnr = {psnr.item():.2f}'
+                + f' test_psnr = {psnr_avg:.2f}'
+            )
+            # print(
+            #     f"elapsed_time={elapsed_time:.2f}s | step={step} | "
+            #     f"loss={loss:.5f} | psnr={psnr:.2f} | "
+            #     f"n_rendering_samples={n_rendering_samples:d} | num_rays={len(pixels):d} | "
+            #     f"max_depth={depth.max():.3f} | "
+            # )
+
         metric.step()
